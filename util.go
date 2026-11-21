@@ -159,10 +159,9 @@ func decomposeString(text string, findColors, findRegions bool) (colorIndices []
 	return colorIndices, colors, regionIndices, regions, escapeIndices, stripped, stringWidth(stripped)
 }
 
-// decomposeTags is decomposeString without the width, which is costly on
-// non-ASCII text and that hot callers (re-indexing, drawing) never use.
+// decomposeTags is decomposeString without width computation.
 func decomposeTags(text string, findColors, findRegions bool) (colorIndices [][]int, colors [][]string, regionIndices [][]int, regions [][]string, escapeIndices [][]int, stripped string) {
-	// Shortcut for the trivial cases: every tag and escape starts with '['.
+	// Skip regexes when no tag can match: all tags start with '['.
 	if !findColors && !findRegions || strings.IndexByte(text, '[') < 0 {
 		return nil, nil, nil, nil, nil, text
 	}
@@ -443,8 +442,7 @@ func TaggedStringWidth(text string) int {
 // text. It splits the text into its grapheme clusters, calculates each
 // cluster's width, and adds them up to a total.
 func stringWidth(text string) (width int) {
-	// Printable ASCII is one cell per byte. Grapheme segmentation is costly
-	// and logs are overwhelmingly ASCII.
+	// Fast path: printable ASCII takes one cell per byte.
 	if isPrintableASCII(text) {
 		return len(text)
 	}
@@ -671,7 +669,7 @@ func stripTags(text string) string {
 	return escapePattern.ReplaceAllString(stripped, `[$1$2]`)
 }
 
-// isPrintableASCII reports whether text only holds bytes in [0x20, 0x7e].
+// isPrintableASCII reports whether all bytes are in [0x20, 0x7e].
 func isPrintableASCII(text string) bool {
 	for i := 0; i < len(text); i++ {
 		if c := text[i]; c < 0x20 || c > 0x7e {

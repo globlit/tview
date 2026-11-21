@@ -118,16 +118,13 @@ type TextView struct {
 	// to be re-indexed.
 	index []*textViewIndex
 
-	// Incremental re-indexing: Write only appends to the buffer, so the index
-	// of the lines it did not touch stays valid. reuse is the index as of the
-	// first Write since the last re-index (nil when a full re-index is
-	// needed), reuseFrom the first buffer line that Write touched, in reuse's
-	// numbering, and reuseShift how many lines Write dropped from the front of
-	// the buffer since then (maxLines).
+	// Incremental re-index state, set by Write. reuse: index before the first
+	// Write, nil forces a full re-index. reuseFrom: first line touched, in
+	// reuse numbering. reuseShift: lines dropped from the front (maxLines).
 	reuse                 []*textViewIndex
 	reuseFrom, reuseShift int
 
-	// The width the index was built for.
+	// Width of the current index.
 	indexWidth int
 
 	// The text alignment, one of AlignLeft, AlignCenter, or AlignRight.
@@ -720,8 +717,7 @@ func (t *TextView) Write(bb []byte) (n int, err error) {
 		}
 	}
 
-	// Keep the current index: only the lines touched from here on need to
-	// be re-indexed.
+	// Keep the index: re-index touched lines only.
 	if t.index != nil {
 		t.reuse, t.reuseFrom, t.reuseShift = t.index, 0, 0
 		if len(t.buffer) > 0 {
@@ -762,19 +758,17 @@ func (t *TextView) Write(bb []byte) (n int, err error) {
 	return len(newBytes), nil
 }
 
-// dropIndex invalidates the index, the next re-index starts from scratch.
+// dropIndex forces a full re-index.
 func (t *TextView) dropIndex() {
 	t.index, t.reuse = nil, nil
 }
 
-// reusableIndex returns the entries of the previous index that are still
-// valid after appends (renumbered after the lines Write dropped), the first
-// buffer line they do not cover, and the entry that line started with. ok is
-// false when a full re-index is needed.
+// reusableIndex returns valid entries renumbered after dropped lines, the
+// first stale line and its first entry. ok=false forces a full re-index.
 func (t *TextView) reusableIndex(width int) (kept []*textViewIndex, start int, from *textViewIndex, ok bool) {
 	reuse, shift := t.reuse, t.reuseShift
 	t.reuse = nil
-	// Highlights are tracked as index positions over the whole buffer.
+	// Highlights hold positions over the whole index.
 	if reuse == nil || width != t.indexWidth || len(t.highlights) > 0 || t.reuseFrom-shift <= 0 {
 		return nil, 0, nil, false
 	}
@@ -792,8 +786,7 @@ func (t *TextView) reusableIndex(width int) (kept []*textViewIndex, start int, f
 	return kept, t.reuseFrom - shift, reuse[hi], true
 }
 
-// indexLine appends the index entries of a buffer line starting with the
-// given state, and returns the state the next line starts with.
+// indexLine indexes one buffer line from state and returns the next line state.
 func (t *TextView) indexLine(bufferIndex, width int, state lineState, splitLines []string) (lineState, []string) {
 	regionID := state.regionID
 	foregroundColor, backgroundColor, attributes := state.foregroundColor, state.backgroundColor, state.attributes
@@ -948,7 +941,7 @@ func (t *TextView) indexLine(bufferIndex, width int, state lineState, splitLines
 	return lineState{foregroundColor, backgroundColor, attributes, regionID}, splitLines
 }
 
-// lineState is the style and region a buffer line starts with.
+// lineState holds style and region at line start.
 type lineState struct {
 	foregroundColor, backgroundColor, attributes, regionID string
 }
@@ -962,11 +955,10 @@ func stateOf(l *textViewIndex) lineState {
 // into the buffer from which on we will print text. It will also contain the
 // colors, attributes, and region with which the line starts.
 //
-// After appends, the index of the untouched lines is reused: entries only
-// depend on the line and the state it starts with. The first line is always
-// re-indexed (it starts from the default state, and may have been trimmed),
-// then old entries are spliced in as soon as a line starts with the state it
-// had, which is exactly what a full re-index yields.
+// After appends, reuse entries of untouched lines: entries depend only on
+// line content and start state. Always re-index line 0, then splice old
+// entries back once a line starts in its old state. Output matches a full
+// re-index.
 //
 // If maxLines is greater than 0, any extra lines will be dropped from the
 // buffer.

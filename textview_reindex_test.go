@@ -85,10 +85,8 @@ func snapshot(tv *TextView) (buffer []string, index []textViewIndex) {
 	return buffer, index
 }
 
-// TestTextViewIncrementalReindex checks that re-indexing only appended lines
-// yields exactly what a full re-index does, for random writes split at
-// arbitrary bytes (mid rune, mid tag), with and without wrapping, tags and
-// maxLines.
+// Compare incremental and full re-index on random writes split mid rune and
+// mid tag, across wrap, tag and maxLines settings.
 func TestTextViewIncrementalReindex(t *testing.T) {
 	var cases []reindexCase
 	for _, wrap := range []bool{false, true} {
@@ -150,7 +148,7 @@ func TestTextViewIncrementalReindex(t *testing.T) {
 					incremental++
 				}
 				ops = append(ops, fmt.Sprintf("draw reuse=%t from=%d shift=%d", got.reuse != nil, got.reuseFrom, got.reuseShift))
-				// The oracle is stock tview: whenever it re-indexes, it does so from scratch.
+				// Oracle: stock tview, full re-index only.
 				want.reuse = nil
 				got.SetRect(0, 0, width, 10)
 				want.SetRect(0, 0, width, 10)
@@ -192,7 +190,7 @@ func TestStringWidthASCIIFastPath(t *testing.T) {
 			t.Errorf("%q: got %d, want %d", s, got, g)
 		}
 	}
-	// Non-ASCII still goes through grapheme segmentation.
+	// Non-ASCII: grapheme segmentation.
 	for s, want := range map[string]int{"héllo": 5, "日本": 4, "é": 1, "a\x00b": 2} {
 		if got := stringWidth(s); got != want {
 			t.Errorf("%q: got %d, want %d", s, got, want)
@@ -222,8 +220,7 @@ func benchLines(n int) []byte {
 	return b
 }
 
-// BenchmarkTextViewLogFrame is a log view: a full buffer, a batch of new
-// lines, then a frame.
+// Simulate a log view: full buffer, append a batch, draw a frame.
 func BenchmarkTextViewLogFrame(b *testing.B) {
 	for _, wrap := range []bool{false, true} {
 		b.Run(fmt.Sprintf("wrap=%t", wrap), func(b *testing.B) {
