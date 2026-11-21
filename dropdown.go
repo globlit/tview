@@ -3,7 +3,7 @@ package tview
 import (
 	"strings"
 
-	"github.com/derailed/tcell/v2"
+	"github.com/globlit/tcell/v2"
 )
 
 // dropDownOption is one option that can be selected in a drop-down primitive.

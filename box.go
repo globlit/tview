@@ -3,7 +3,7 @@ package tview
 import (
 	"fmt"
 
-	"github.com/derailed/tcell/v2"
+	"github.com/globlit/tcell/v2"
 )
 
 // Box implements the Primitive interface with an empty background and optional

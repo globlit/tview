@@ -1,7 +1,7 @@
 package tview
 
 import (
-	"github.com/derailed/tcell/v2"
+	"github.com/globlit/tcell/v2"
 )
 
 // page represents one page of a Pages object.

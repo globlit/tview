@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/derailed/tcell/v2"
+	"github.com/globlit/tcell/v2"
 )
 
 var reindexWords = []string{

@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/derailed/tcell/v2"
+	"github.com/globlit/tcell/v2"
 	runewidth "github.com/mattn/go-runewidth"
 	"github.com/rivo/uniseg"
 )

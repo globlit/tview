@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/derailed/tcell/v2"
+	"github.com/globlit/tcell/v2"
 )
 
 // listItem represents one item in a List.

@@ -1,7 +1,7 @@
 package tview
 
 import (
-	"github.com/derailed/tcell/v2"
+	"github.com/globlit/tcell/v2"
 )
 
 // Button is labeled box that triggers an action when selected.
