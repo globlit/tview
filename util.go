@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/derailed/tcell/v2"
 	runewidth "github.com/mattn/go-runewidth"
@@ -153,9 +154,17 @@ func overlayStyle(style tcell.Style, fgColor, bgColor, attributes string) tcell.
 // region tags are requested), the string stripped by any tags and escaped, and
 // the screen width of the stripped string.
 func decomposeString(text string, findColors, findRegions bool) (colorIndices [][]int, colors [][]string, regionIndices [][]int, regions [][]string, escapeIndices [][]int, stripped string, width int) {
-	// Shortcut for the trivial case.
-	if !findColors && !findRegions {
-		return nil, nil, nil, nil, nil, text, stringWidth(text)
+	colorIndices, colors, regionIndices, regions, escapeIndices, stripped = decomposeTags(text, findColors, findRegions)
+
+	return colorIndices, colors, regionIndices, regions, escapeIndices, stripped, stringWidth(stripped)
+}
+
+// decomposeTags is decomposeString without the width, which is costly on
+// non-ASCII text and that hot callers (re-indexing, drawing) never use.
+func decomposeTags(text string, findColors, findRegions bool) (colorIndices [][]int, colors [][]string, regionIndices [][]int, regions [][]string, escapeIndices [][]int, stripped string) {
+	// Shortcut for the trivial cases: every tag and escape starts with '['.
+	if !findColors && !findRegions || strings.IndexByte(text, '[') < 0 {
+		return nil, nil, nil, nil, nil, text
 	}
 
 	// Get positions of any tags.
@@ -206,9 +215,6 @@ func decomposeString(text string, findColors, findRegions bool) (colorIndices []
 	}
 	buf = append(buf, text[from:]...)
 	stripped = string(buf)
-
-	// Get the width of the stripped string.
-	width = stringWidth(stripped)
 
 	return
 }
@@ -437,6 +443,11 @@ func TaggedStringWidth(text string) int {
 // text. It splits the text into its grapheme clusters, calculates each
 // cluster's width, and adds them up to a total.
 func stringWidth(text string) (width int) {
+	// Printable ASCII is one cell per byte. Grapheme segmentation is costly
+	// and logs are overwhelmingly ASCII.
+	if isPrintableASCII(text) {
+		return len(text)
+	}
 	g := uniseg.NewGraphemes(text)
 	for g.Next() {
 		var chWidth int
@@ -459,7 +470,7 @@ func stringWidth(text string) (width int) {
 //
 // Text is always split at newline characters ('\n').
 func WordWrap(text string, width int) (lines []string) {
-	colorTagIndices, _, _, _, escapeIndices, strippedText, _ := decomposeString(text, true, false)
+	colorTagIndices, _, _, _, escapeIndices, strippedText := decomposeTags(text, true, false)
 
 	// Find candidate breakpoints.
 	breakpoints := boundaryPattern.FindAllStringSubmatchIndex(strippedText, -1)
@@ -658,4 +669,15 @@ func stripTags(text string) string {
 		return match
 	})
 	return escapePattern.ReplaceAllString(stripped, `[$1$2]`)
+}
+
+// isPrintableASCII reports whether text only holds bytes in [0x20, 0x7e].
+func isPrintableASCII(text string) bool {
+	for i := 0; i < len(text); i++ {
+		if c := text[i]; c < 0x20 || c > 0x7e {
+			return false
+		}
+	}
+
+	return true
 }
