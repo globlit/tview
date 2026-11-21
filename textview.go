@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -116,6 +117,18 @@ type TextView struct {
 	// The processed line index. This is nil if the buffer has changed and needs
 	// to be re-indexed.
 	index []*textViewIndex
+
+	// Incremental re-indexing: Write only appends to the buffer, so the index
+	// of the lines it did not touch stays valid. reuse is the index as of the
+	// first Write since the last re-index (nil when a full re-index is
+	// needed), reuseFrom the first buffer line that Write touched, in reuse's
+	// numbering, and reuseShift how many lines Write dropped from the front of
+	// the buffer since then (maxLines).
+	reuse                 []*textViewIndex
+	reuseFrom, reuseShift int
+
+	// The width the index was built for.
+	indexWidth int
 
 	// The text alignment, one of AlignLeft, AlignCenter, or AlignRight.
 	align int
@@ -254,7 +267,7 @@ func (t *TextView) SetScrollable(scrollable bool) *TextView {
 // beyond the available width are not displayed.
 func (t *TextView) SetWrap(wrap bool) *TextView {
 	if t.wrap != wrap {
-		t.index = nil
+		t.dropIndex()
 	}
 	t.wrap = wrap
 	return t
@@ -267,7 +280,7 @@ func (t *TextView) SetWrap(wrap bool) *TextView {
 // This flag is ignored if the "wrap" flag is false.
 func (t *TextView) SetWordWrap(wrapOnWords bool) *TextView {
 	if t.wordWrap != wrapOnWords {
-		t.index = nil
+		t.dropIndex()
 	}
 	t.wordWrap = wrapOnWords
 	return t
@@ -291,7 +304,7 @@ func (t *TextView) SetMaxLines(maxLines int) *TextView {
 // either AlignLeft, AlignCenter, or AlignRight.
 func (t *TextView) SetTextAlign(align int) *TextView {
 	if t.align != align {
-		t.index = nil
+		t.dropIndex()
 	}
 	t.align = align
 	return t
@@ -351,7 +364,7 @@ func (t *TextView) GetText(stripAllTags bool) string {
 // dynamically. See class description for details.
 func (t *TextView) SetDynamicColors(dynamic bool) *TextView {
 	if t.dynamicColors != dynamic {
-		t.index = nil
+		t.dropIndex()
 	}
 	t.dynamicColors = dynamic
 	return t
@@ -361,7 +374,7 @@ func (t *TextView) SetDynamicColors(dynamic bool) *TextView {
 // description for details.
 func (t *TextView) SetRegions(regions bool) *TextView {
 	if t.regions != regions {
-		t.index = nil
+		t.dropIndex()
 	}
 	t.regions = regions
 	return t
@@ -453,7 +466,7 @@ func (t *TextView) GetScrollOffset() (row, column int) {
 func (t *TextView) Clear() *TextView {
 	t.buffer = t.buffer[:0]
 	t.recentBytes = t.recentBytes[:0]
-	t.index = nil
+	t.dropIndex()
 	return t
 }
 
@@ -514,7 +527,7 @@ func (t *TextView) Highlight(regionIDs ...string) *TextView {
 		}
 		t.highlights[id] = struct{}{}
 	}
-	t.index = nil
+	t.dropIndex()
 
 	// Notify.
 	if t.highlighted != nil && len(added) > 0 || len(removed) > 0 {
@@ -553,7 +566,7 @@ func (t *TextView) ScrollToHighlight() *TextView {
 	if len(t.highlights) == 0 || !t.scrollable || !t.regions {
 		return t
 	}
-	t.index = nil
+	t.dropIndex()
 	t.scrollToHighlights = true
 	t.trackEnd = false
 	return t
@@ -707,6 +720,16 @@ func (t *TextView) Write(bb []byte) (n int, err error) {
 		}
 	}
 
+	// Keep the current index: only the lines touched from here on need to
+	// be re-indexed.
+	if t.index != nil {
+		t.reuse, t.reuseFrom, t.reuseShift = t.index, 0, 0
+		if len(t.buffer) > 0 {
+			t.reuseFrom = len(t.buffer) - 1
+		}
+		t.index = nil
+	}
+
 	var bufferIndex int
 	if len(t.buffer) > 0 {
 		bufferIndex = len(t.buffer) - 1
@@ -721,6 +744,7 @@ func (t *TextView) Write(bb []byte) (n int, err error) {
 				line := t.buffer[0]
 				t.buffer = t.buffer[1:]
 				t.buffer = append(t.buffer, line[:0])
+				t.reuseShift++
 			} else {
 				t.buffer = append(t.buffer, make([]byte, 0, defaultLineSize))
 			}
@@ -738,10 +762,211 @@ func (t *TextView) Write(bb []byte) (n int, err error) {
 	return len(newBytes), nil
 }
 
+// dropIndex invalidates the index, the next re-index starts from scratch.
+func (t *TextView) dropIndex() {
+	t.index, t.reuse = nil, nil
+}
+
+// reusableIndex returns the entries of the previous index that are still
+// valid after appends (renumbered after the lines Write dropped), the first
+// buffer line they do not cover, and the entry that line started with. ok is
+// false when a full re-index is needed.
+func (t *TextView) reusableIndex(width int) (kept []*textViewIndex, start int, from *textViewIndex, ok bool) {
+	reuse, shift := t.reuse, t.reuseShift
+	t.reuse = nil
+	// Highlights are tracked as index positions over the whole buffer.
+	if reuse == nil || width != t.indexWidth || len(t.highlights) > 0 || t.reuseFrom-shift <= 0 {
+		return nil, 0, nil, false
+	}
+	// Entries are sorted by buffer line: keep [shift, reuseFrom).
+	lo := sort.Search(len(reuse), func(i int) bool { return reuse[i].Line >= shift })
+	hi := sort.Search(len(reuse), func(i int) bool { return reuse[i].Line >= t.reuseFrom })
+	if hi >= len(reuse) || reuse[hi].Line != t.reuseFrom || lo > hi {
+		return nil, 0, nil, false
+	}
+	kept = reuse[lo:hi]
+	for _, line := range kept {
+		line.Line -= shift
+	}
+
+	return kept, t.reuseFrom - shift, reuse[hi], true
+}
+
+// indexLine appends the index entries of a buffer line starting with the
+// given state, and returns the state the next line starts with.
+func (t *TextView) indexLine(bufferIndex, width int, state lineState, splitLines []string) (lineState, []string) {
+	regionID := state.regionID
+	foregroundColor, backgroundColor, attributes := state.foregroundColor, state.backgroundColor, state.attributes
+	bline := t.buffer[bufferIndex]
+	lineStart := len(t.index)
+	colorTagIndices, colorTags, regionIndices, regions, escapeIndices, strippedStr := decomposeTags(string(bline), t.dynamicColors, t.regions)
+
+	// Split the line if required.
+	splitLines = splitLines[:0]
+	if t.wrap && len(strippedStr) > 0 {
+		var extract string
+		for len(strippedStr) > 0 {
+			// !!BOZO!! This is a dog. Would this work instead??
+			// extract := runewidth.Truncate(strippedStr, width, "")
+			if len(strippedStr) > width {
+				extract = strippedStr[:width]
+			} else {
+				extract = strippedStr
+			}
+
+			if len(extract) == 0 {
+				// We'll extract at least one grapheme cluster.
+				gr := uniseg.NewGraphemes(strippedStr)
+				gr.Next()
+				_, to := gr.Positions()
+				extract = strippedStr[:to]
+			}
+
+			if t.wordWrap && len(extract) < len(strippedStr) {
+				// Add any spaces from the next line.
+				if spaces := spacePattern.FindStringIndex(strippedStr[len(extract):]); spaces != nil && spaces[0] == 0 {
+					extract = strippedStr[:len(extract)+spaces[1]]
+				}
+				// Can we split before the mandatory end?
+				matches := boundaryPattern.FindAllStringIndex(extract, -1)
+				if len(matches) > 0 {
+					// Yes. Let's split there.
+					extract = extract[:matches[len(matches)-1][1]]
+				}
+			}
+			splitLines = append(splitLines, extract)
+			strippedStr = strippedStr[len(extract):]
+		}
+	} else {
+		// No need to split the line.
+		splitLines = append(splitLines, strippedStr)
+	}
+
+	// Create index from split lines.
+	var originalPos, colorPos, regionPos, escapePos int
+	for _, splitLine := range splitLines {
+		line := textViewIndex{
+			Line:            bufferIndex,
+			Pos:             originalPos,
+			ForegroundColor: foregroundColor,
+			BackgroundColor: backgroundColor,
+			Attributes:      attributes,
+			Region:          regionID,
+		}
+
+		// Shift original position with tags.
+		var (
+			lineLength             = len(splitLine)
+			remainingLength        = lineLength
+			tagEnd, totalTagLength = originalPos, 0
+			nextTag                = make([][3]int, 0, 3)
+		)
+		for {
+			// Which tag comes next?
+			nextTag = nextTag[:0]
+			if colorPos < len(colorTagIndices) {
+				nextTag = append(nextTag, [3]int{colorTagIndices[colorPos][0], colorTagIndices[colorPos][1], 0}) // 0 = color tag.
+			}
+			if regionPos < len(regionIndices) {
+				nextTag = append(nextTag, [3]int{regionIndices[regionPos][0], regionIndices[regionPos][1], 1}) // 1 = region tag.
+			}
+			if escapePos < len(escapeIndices) {
+				nextTag = append(nextTag, [3]int{escapeIndices[escapePos][0], escapeIndices[escapePos][1], 2}) // 2 = escape tag.
+			}
+			minPos, tagIndex := -1, -1
+			for index, pair := range nextTag {
+				if minPos < 0 || pair[0] < minPos {
+					minPos, tagIndex = pair[0], index
+				}
+			}
+			// Is the next tag in range?
+			if tagIndex < 0 || minPos > tagEnd+remainingLength {
+				break // No. We're done with this line.
+			}
+
+			// Advance.
+			strippedTagStart := nextTag[tagIndex][0] - originalPos - totalTagLength
+			tagEnd = nextTag[tagIndex][1]
+			tagLength := tagEnd - nextTag[tagIndex][0]
+			if nextTag[tagIndex][2] == 2 {
+				tagLength = 1
+			}
+			totalTagLength += tagLength
+			remainingLength = lineLength - (tagEnd - originalPos - totalTagLength)
+
+			// Process the tag.
+			switch nextTag[tagIndex][2] {
+			case 0:
+				// Process color tags.
+				if len(colorTags[colorPos]) == 4 {
+					foregroundColor, backgroundColor, attributes = styleFromTag(foregroundColor, backgroundColor, attributes, colorTags[colorPos])
+				}
+				colorPos++
+			case 1:
+				// Process region tags.
+				regionID = regions[regionPos][1]
+				if _, ok := t.highlights[regionID]; ok {
+					// Update highlight range.
+					line := len(t.index)
+					if t.fromHighlight < 0 {
+						t.fromHighlight, t.toHighlight = line, line
+						t.posHighlight = stringWidth(splitLine[:strippedTagStart])
+					} else if line > t.toHighlight {
+						t.toHighlight = line
+					}
+				}
+				regionPos++
+			case 2:
+				// Process escape tags.
+				escapePos++
+			}
+		}
+		// Advance to next line.
+		originalPos += lineLength + totalTagLength
+
+		// Append this line.
+		line.NextPos = originalPos
+		line.Width = stringWidth(splitLine)
+		t.index = append(t.index, &line)
+	}
+
+	// Word-wrapped lines may have trailing whitespace. Remove it.
+	if t.wrap && t.wordWrap {
+		for _, line := range t.index[lineStart:] {
+			str := string(t.buffer[line.Line][line.Pos:line.NextPos])
+			if strings.HasSuffix(str, " ") {
+				spaces := spacePattern.FindAllStringIndex(str, -1)
+				if spaces != nil && spaces[len(spaces)-1][1] == len(str) {
+					oldNextPos := line.NextPos
+					line.NextPos -= spaces[len(spaces)-1][1] - spaces[len(spaces)-1][0]
+					line.Width -= stringWidth(string(t.buffer[line.Line][line.NextPos:oldNextPos]))
+				}
+			}
+		}
+	}
+
+	return lineState{foregroundColor, backgroundColor, attributes, regionID}, splitLines
+}
+
+// lineState is the style and region a buffer line starts with.
+type lineState struct {
+	foregroundColor, backgroundColor, attributes, regionID string
+}
+
+func stateOf(l *textViewIndex) lineState {
+	return lineState{l.ForegroundColor, l.BackgroundColor, l.Attributes, l.Region}
+}
+
 // reindexBuffer re-indexes the buffer such that we can use it to easily draw
 // the buffer onto the screen. Each line in the index will contain a pointer
 // into the buffer from which on we will print text. It will also contain the
 // colors, attributes, and region with which the line starts.
+//
+// After appends, the index of the untouched lines is reused: entries only
+// depend on the line and the state it starts with. The first line is always
+// re-indexed (it starts from the default state, and may have been trimmed),
+// then old entries are spliced in as soon as a line starts with the state it
+// had, which is exactly what a full re-index yields.
 //
 // If maxLines is greater than 0, any extra lines will be dropped from the
 // buffer.
@@ -749,167 +974,37 @@ func (t *TextView) reindexBuffer(width int) {
 	if t.index != nil {
 		return // Nothing has changed. We can still use the current index.
 	}
-	t.index = t.index[:0]
+	kept, start, from, incremental := t.reusableIndex(width)
+	t.index = nil
 	t.fromHighlight, t.toHighlight, t.posHighlight = -1, -1, -1
 
 	// If there's no space, there's no index.
 	if width < 1 {
 		return
 	}
+	t.indexWidth = width
+	t.index = make([]*textViewIndex, 0, len(kept)+len(t.buffer)-start+1)
 
 	var (
-		regionID                                     string
-		foregroundColor, backgroundColor, attributes string
+		state      lineState
+		splitLines = make([]string, 0, 1_000)
+		k          int
 	)
-
-	splitLines := make([]string, 0, 1_000)
 	// Go through each line in the buffer.
-	for bufferIndex, bline := range t.buffer {
-		colorTagIndices, colorTags, regionIndices, regions, escapeIndices, strippedStr, _ := decomposeString(string(bline), t.dynamicColors, t.regions)
-
-		// Split the line if required.
-		splitLines = splitLines[:0]
-		if t.wrap && len(strippedStr) > 0 {
-			var extract string
-			for len(strippedStr) > 0 {
-				// !!BOZO!! This is a dog. Would this work instead??
-				// extract := runewidth.Truncate(strippedStr, width, "")
-				if len(strippedStr) > width {
-					extract = strippedStr[:width]
-				} else {
-					extract = strippedStr
-				}
-
-				if len(extract) == 0 {
-					// We'll extract at least one grapheme cluster.
-					gr := uniseg.NewGraphemes(strippedStr)
-					gr.Next()
-					_, to := gr.Positions()
-					extract = strippedStr[:to]
-				}
-
-				if t.wordWrap && len(extract) < len(strippedStr) {
-					// Add any spaces from the next line.
-					if spaces := spacePattern.FindStringIndex(strippedStr[len(extract):]); spaces != nil && spaces[0] == 0 {
-						extract = strippedStr[:len(extract)+spaces[1]]
-					}
-					// Can we split before the mandatory end?
-					matches := boundaryPattern.FindAllStringIndex(extract, -1)
-					if len(matches) > 0 {
-						// Yes. Let's split there.
-						extract = extract[:matches[len(matches)-1][1]]
-					}
-				}
-				splitLines = append(splitLines, extract)
-				strippedStr = strippedStr[len(extract):]
+	for bufferIndex := 0; bufferIndex < len(t.buffer); bufferIndex++ {
+		if incremental && bufferIndex > 0 && bufferIndex < start {
+			for k < len(kept) && kept[k].Line < bufferIndex {
+				k++
 			}
-		} else {
-			// No need to split the line.
-			splitLines = append(splitLines, strippedStr)
-		}
-
-		// Create index from split lines.
-		var originalPos, colorPos, regionPos, escapePos int
-		for _, splitLine := range splitLines {
-			line := textViewIndex{
-				Line:            bufferIndex,
-				Pos:             originalPos,
-				ForegroundColor: foregroundColor,
-				BackgroundColor: backgroundColor,
-				Attributes:      attributes,
-				Region:          regionID,
-			}
-
-			// Shift original position with tags.
-			var (
-				lineLength             = len(splitLine)
-				remainingLength        = lineLength
-				tagEnd, totalTagLength = originalPos, 0
-				nextTag                = make([][3]int, 0, 3)
-			)
-			for {
-				// Which tag comes next?
-				nextTag = nextTag[:0]
-				if colorPos < len(colorTagIndices) {
-					nextTag = append(nextTag, [3]int{colorTagIndices[colorPos][0], colorTagIndices[colorPos][1], 0}) // 0 = color tag.
-				}
-				if regionPos < len(regionIndices) {
-					nextTag = append(nextTag, [3]int{regionIndices[regionPos][0], regionIndices[regionPos][1], 1}) // 1 = region tag.
-				}
-				if escapePos < len(escapeIndices) {
-					nextTag = append(nextTag, [3]int{escapeIndices[escapePos][0], escapeIndices[escapePos][1], 2}) // 2 = escape tag.
-				}
-				minPos, tagIndex := -1, -1
-				for index, pair := range nextTag {
-					if minPos < 0 || pair[0] < minPos {
-						minPos, tagIndex = pair[0], index
-					}
-				}
-				// Is the next tag in range?
-				if tagIndex < 0 || minPos > tagEnd+remainingLength {
-					break // No. We're done with this line.
-				}
-
-				// Advance.
-				strippedTagStart := nextTag[tagIndex][0] - originalPos - totalTagLength
-				tagEnd = nextTag[tagIndex][1]
-				tagLength := tagEnd - nextTag[tagIndex][0]
-				if nextTag[tagIndex][2] == 2 {
-					tagLength = 1
-				}
-				totalTagLength += tagLength
-				remainingLength = lineLength - (tagEnd - originalPos - totalTagLength)
-
-				// Process the tag.
-				switch nextTag[tagIndex][2] {
-				case 0:
-					// Process color tags.
-					if len(colorTags[colorPos]) == 4 {
-						foregroundColor, backgroundColor, attributes = styleFromTag(foregroundColor, backgroundColor, attributes, colorTags[colorPos])
-					}
-					colorPos++
-				case 1:
-					// Process region tags.
-					regionID = regions[regionPos][1]
-					if _, ok := t.highlights[regionID]; ok {
-						// Update highlight range.
-						line := len(t.index)
-						if t.fromHighlight < 0 {
-							t.fromHighlight, t.toHighlight = line, line
-							t.posHighlight = stringWidth(splitLine[:strippedTagStart])
-						} else if line > t.toHighlight {
-							t.toHighlight = line
-						}
-					}
-					regionPos++
-				case 2:
-					// Process escape tags.
-					escapePos++
-				}
-			}
-			// Advance to next line.
-			originalPos += lineLength + totalTagLength
-
-			// Append this line.
-			line.NextPos = originalPos
-			line.Width = stringWidth(splitLine)
-			t.index = append(t.index, &line)
-		}
-
-		// Word-wrapped lines may have trailing whitespace. Remove it.
-		if t.wrap && t.wordWrap {
-			for _, line := range t.index {
-				str := string(t.buffer[line.Line][line.Pos:line.NextPos])
-				if strings.HasSuffix(str, " ") {
-					spaces := spacePattern.FindAllStringIndex(str, -1)
-					if spaces != nil && spaces[len(spaces)-1][1] == len(str) {
-						oldNextPos := line.NextPos
-						line.NextPos -= spaces[len(spaces)-1][1] - spaces[len(spaces)-1][0]
-						line.Width -= stringWidth(string(t.buffer[line.Line][line.NextPos:oldNextPos]))
-					}
-				}
+			if k < len(kept) && kept[k].Line == bufferIndex && stateOf(kept[k]) == state {
+				t.index = append(t.index, kept[k:]...)
+				bufferIndex, state = start, stateOf(from)
 			}
 		}
+		state, splitLines = t.indexLine(bufferIndex, width, state, splitLines)
+	}
+	if len(t.index) == 0 {
+		t.index = nil // An empty buffer has no index.
 	}
 
 	// Drop lines beyond maxLines.
@@ -984,7 +1079,7 @@ func (t *TextView) Draw(screen tcell.Screen) {
 
 	// If the width has changed, we need to reindex.
 	if width != t.lastWidth && t.wrap {
-		t.index = nil
+		t.dropIndex()
 	}
 	t.lastWidth = width
 
@@ -1091,7 +1186,7 @@ func (t *TextView) Draw(screen tcell.Screen) {
 		}
 
 		// Process tags.
-		colorTagIndices, colorTags, regionIndices, regions, escapeIndices, strippedText, _ := decomposeString(string(text), t.dynamicColors, t.regions)
+		colorTagIndices, colorTags, regionIndices, regions, escapeIndices, strippedText := decomposeTags(string(text), t.dynamicColors, t.regions)
 		// Calculate the position of the line.
 		var skip, posX int
 		if t.align == AlignLeft {
@@ -1208,7 +1303,7 @@ func (t *TextView) Draw(screen tcell.Screen) {
 		} else {
 			t.buffer = t.buffer[t.index[t.lineOffset].Line:]
 		}
-		t.index = nil
+		t.dropIndex()
 		t.lineOffset = 0
 	}
 }
