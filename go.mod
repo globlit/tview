@@ -1,4 +1,4 @@
-module github.com/derailed/tview
+module github.com/globlit/tview
 
 go 1.19
 
